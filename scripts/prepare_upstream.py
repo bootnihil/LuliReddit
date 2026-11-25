@@ -119,6 +119,17 @@ class EmptyAllFeedFallbackTest {
 }
 ''', encoding="utf-8")
 
+    # Preserve the upstream changelog test with our BN version suffix.
+    test_path = root / "app/src/test/java/com/bennybar/luli_for_reddit/feature/about/WhatsNewTest.kt"
+    test_source = test_path.read_text(encoding="utf-8")
+    test_source = replace_exactly_once(
+        test_source,
+        "assertEquals(com.bennybar.luli_for_reddit.BuildConfig.VERSION_NAME, CHANGELOG.first().version)",
+        f'assertEquals(com.bennybar.luli_for_reddit.BuildConfig.VERSION_NAME.removeSuffix("-bn{PATCH_REVISION}"), CHANGELOG.first().version)',
+        "WhatsNew version assertion",
+    )
+    test_path.write_text(test_source, encoding="utf-8")
+
     gradle_path = root / "app/build.gradle.kts"
     gradle = gradle_path.read_text(encoding="utf-8")
     m_code = re.search(r'^\s*versionCode\s*=\s*(\d+)\s*$', gradle, re.M)
