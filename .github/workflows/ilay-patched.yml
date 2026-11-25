@@ -1,0 +1,147 @@
+name: Ilay BN — patched APK
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *' # Daily upstream check; UTC
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ilay-patched.yml'
+      - 'scripts/prepare_upstream.py'
+
+permissions:
+  contents: write # Required for publishing APK releases in this fork
+
+concurrency:
+  group: ilay-bn-release
+  cancel-in-progress: false
+
+jobs:
+  patched-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out build automation from fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out latest upstream Ilay
+        uses: actions/checkout@v4
+        with:
+          repository: bennybar/LuliReddit
+          ref: main
+          path: upstream
+          persist-credentials: false
+
+      - name: Apply and verify targeted changes
+        run: |
+          python3 scripts/prepare_upstream.py --root upstream
+          version=$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)".*/\1/p' upstream/app/build.gradle.kts | head -1)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_ENV"
+          echo "tag=v$version" >> "$GITHUB_ENV"
+          echo "upstream_sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Check whether this version is already published
+        id: release_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Already published $tag; nothing to rebuild." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK 21
+        if: steps.release_check.outputs.exists == 'false'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: |
+            upstream/**/*.gradle.kts
+            upstream/gradle/libs.versions.toml
+            upstream/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Android SDK
+        if: steps.release_check.outputs.exists == 'false'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform 37
+        if: steps.release_check.outputs.exists == 'false'
+        run: sdkmanager --install 'platforms;android-37' 'build-tools;37.0.0'
+
+      - name: Restore the stable release signing key
+        if: steps.release_check.outputs.exists == 'false'
+        env:
+          ILAY_KEYSTORE_B64: ${{ secrets.ILAY_KEYSTORE_B64 }}
+          ILAY_STORE_PASSWORD: ${{ secrets.ILAY_STORE_PASSWORD }}
+          ILAY_KEY_ALIAS: ${{ secrets.ILAY_KEY_ALIAS }}
+          ILAY_KEY_PASSWORD: ${{ secrets.ILAY_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in ILAY_KEYSTORE_B64 ILAY_STORE_PASSWORD ILAY_KEY_ALIAS ILAY_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+          printf '%s' "$ILAY_KEYSTORE_B64" | base64 -d > upstream/ilay-bn-release.jks
+          chmod 600 upstream/ilay-bn-release.jks
+          {
+            printf 'storeFile=ilay-bn-release.jks\n'
+            printf 'storePassword=%s\n' "$ILAY_STORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$ILAY_KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$ILAY_KEY_PASSWORD"
+          } > upstream/key.properties
+          chmod 600 upstream/key.properties
+
+      - name: Run regression tests and build signed universal APK
+        if: steps.release_check.outputs.exists == 'false'
+        working-directory: upstream
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:testReleaseUnitTest :app:assembleRelease
+
+      - name: Verify APK and stage release asset
+        if: steps.release_check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=$(find upstream/app/build/outputs/apk/release -name '*universal*release.apk' -type f | head -1)
+          if [[ -z "$apk" ]]; then
+            echo 'No universal release APK found; refusing to publish a split or unsigned APK.' >&2
+            exit 1
+          fi
+          signer=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)
+          test -x "$signer"
+          "$signer" verify --verbose --print-certs "$apk"
+          mkdir -p dist
+          cp "$apk" "dist/Ilay-BN-${version}-universal.apk"
+          sha256sum "dist/Ilay-BN-${version}-universal.apk" | tee dist/SHA256SUMS.txt
+
+      - name: Upload workflow artifact
+        if: steps.release_check.outputs.exists == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ilay-BN-${{ env.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: steps.release_check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$tag" dist/*.apk dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Ilay BN $version" \
+            --notes "Personal patched build of Ilay from upstream commit $upstream_sha.\n\nChange: When the live website r/all listing is empty, retry its existing AllFeedSdui GraphQL query. This does not guarantee Reddit still serves r/all over GraphQL.\n\nSeparate app ID: com.bennybar.luli_for_reddit.bootnihil. Signed with a stable personal signing key; installs alongside official Ilay."
+          echo "Published [$tag](https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag)" >> "$GITHUB_STEP_SUMMARY"
