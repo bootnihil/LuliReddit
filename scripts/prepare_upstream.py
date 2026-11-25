@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply a narrowly scoped, fail-closed Ilay r/all GraphQL fallback patch.
+"""Apply a narrowly scoped, fail-closed Ilay r/all GraphQL and Old Reddit fallback patch.
 
 Runs against a fresh upstream checkout, leaving the fork's upstream tree untouched.
 Bump PATCH_REVISION when changing the shipped patch for the same upstream version.
@@ -10,7 +10,7 @@ import argparse
 import re
 from pathlib import Path
 
-PATCH_REVISION = 1
+PATCH_REVISION = 2
 APP_ID = "com.bennybar.luli_for_reddit.bootnihil"
 
 
@@ -81,6 +81,20 @@ def prepare(root: Path) -> tuple[str, int]:
 '''
     repo_path.write_text(replace_exactly_once(repo, old, new, "r/all listing fallback"), encoding="utf-8")
 
+    # v2: intercept website-mode r/all BEFORE the retired modern JSON / GraphQL feed.
+    repo = repo_path.read_text(encoding="utf-8")
+    repo = replace_exactly_once(
+        repo,
+        '        val base = if (subreddit == null) "" else "/r/$subreddit"\n        // Keep the existing GraphQL fallback',
+        '        if (subreddit.equals("all", ignoreCase = true) && client.isWebMode()) {\n'
+        '            return fetchOldRedditAllPosts(sort, time, after, limit)\n'
+        '        }\n'
+        '        val base = if (subreddit == null) "" else "/r/$subreddit"\n'
+        '        // Keep the existing GraphQL fallback',
+        "Old Reddit r/all interception",
+    )
+    repo_path.write_text(repo, encoding="utf-8")
+
     predicate_path = repo_path.with_name("EmptyAllFeedFallback.kt")
     if predicate_path.exists():
         raise RuntimeError("Upstream now has EmptyAllFeedFallback.kt; review the patch before building.")
@@ -129,6 +143,45 @@ class EmptyAllFeedFallbackTest {
         "WhatsNew version assertion",
     )
     test_path.write_text(test_source, encoding="utf-8")
+
+    client_path = root / "app/src/main/java/com/bennybar/luli_for_reddit/core/net/RedditClient.kt"
+    client = client_path.read_text(encoding="utf-8")
+    client = replace_exactly_once(
+        client,
+        "    suspend fun get(path: String, query: Map<String, Any?> = emptyMap()): JsonElement = getResult(path, query).json",
+        """    /** Old Reddit's real r/all HTML, with our existing website-session cookies. */
+    suspend fun getOldRedditAllHtml(sort: String, time: String?, after: String?, limit: Int): String {
+        ensureConfig()
+        if (!webMode) throw IllegalStateException("Old Reddit feed requires website-session login.")
+        val url = "https://old.reddit.com/r/all/$sort/".toHttpUrl().newBuilder()
+            .addQueryParameter("limit", limit.coerceIn(1, 100).toString())
+            .apply {
+                if (time != null) addQueryParameter("t", time)
+                if (after != null) addQueryParameter("after", after)
+            }.build().toString()
+        val (status, html) = execute("GET", url, null)
+        if (status !in 200..299) throw RedditApiException(status)
+        // A browser challenge, login page or unexpected HTML must not look like an empty feed.
+        if (!html.contains("data-fullname") || !html.contains("siteTable")) {
+            throw IllegalStateException("Old Reddit didn't return a recognizable r/all listing.")
+        }
+        return html
+    }
+
+    suspend fun get(path: String, query: Map<String, Any?> = emptyMap()): JsonElement = getResult(path, query).json""",
+        "Old Reddit authenticated HTML fetch",
+    )
+    client_path.write_text(client, encoding="utf-8")
+
+    old_reddit_path = repo_path.with_name("OldRedditAll.kt")
+    if old_reddit_path.exists():
+        raise RuntimeError("Upstream added OldRedditAll.kt; review before patching.")
+    old_reddit_path.write_text('package com.bennybar.luli_for_reddit.data\n\nimport com.bennybar.luli_for_reddit.model.Listing\nimport com.bennybar.luli_for_reddit.model.Post\n\n// Old Reddit still offers the actual r/all feed (distinct from r/popular).\n// Read only post fullnames from its listing; hydrate post cards through Ilay\'s\n// existing PostsByIds implementation rather than interpreting HTML as posts.\nprivate val oldRedditTags = Regex("""<div\\b[^>]*>""", RegexOption.IGNORE_CASE)\nprivate val oldRedditClass = Regex("""\\bclass\\s*=\\s*(["\'])(.*?)\\1""", RegexOption.IGNORE_CASE)\nprivate val oldRedditFullname = Regex("""\\bdata-fullname\\s*=\\s*(["\'])(t3_[a-z0-9]+)\\1""", RegexOption.IGNORE_CASE)\nprivate val oldRedditNext = Regex("""\\bclass\\s*=\\s*(["\'])[^"\']*\\bnext-button\\b[^"\']*\\1""", RegexOption.IGNORE_CASE)\n\ninternal fun oldRedditAllPostIds(html: String): List<String> = oldRedditTags.findAll(html)\n    .mapNotNull { match ->\n        val tag = match.value\n        val classes = oldRedditClass.find(tag)?.groupValues?.get(2)\n            ?.split(Regex("""\\s+""")) ?: return@mapNotNull null\n        if ("thing" !in classes || "link" !in classes) return@mapNotNull null\n        oldRedditFullname.find(tag)?.groupValues?.get(2)\n    }\n    .distinct()\n    .toList()\n\ninternal fun oldRedditAllHasNext(html: String): Boolean = oldRedditNext.containsMatchIn(html)\n\n/** Website-session-only r/all fallback. Never substitutes the r/popular feed. */\ninternal suspend fun RedditRepository.fetchOldRedditAllPosts(\n    sort: PostSort,\n    time: TopTime,\n    after: String?,\n    limit: Int,\n): Listing<Post> {\n    // Old Reddit has no "best" sort for r/all; its canonical listing is "hot".\n    val legacySort = if (sort == PostSort.BEST) "hot" else sort.path\n    val html = client.getOldRedditAllHtml(\n        sort = legacySort,\n        time = if (sort.needsTime) time.param else null,\n        after = after,\n        limit = limit,\n    )\n    val ids = oldRedditAllPostIds(html)\n    if (ids.isEmpty()) {\n        throw IllegalStateException("Old Reddit r/all returned no post IDs (login, block, or changed HTML).")\n    }\n    val posts = getPostsByIds(ids)\n    if (posts.isEmpty()) {\n        throw IllegalStateException("Old Reddit listed ${ids.size} r/all posts, but Reddit\'s PostsByIds returned none.")\n    }\n    return Listing(posts, if (oldRedditAllHasNext(html)) ids.last() else null)\n}\n', encoding="utf-8")
+    old_reddit_test_path = root / "app/src/test/java/com/bennybar/luli_for_reddit/data/OldRedditAllTest.kt"
+    if old_reddit_test_path.exists():
+        raise RuntimeError("Upstream added OldRedditAllTest.kt; review before patching.")
+    old_reddit_test_path.parent.mkdir(parents=True, exist_ok=True)
+    old_reddit_test_path.write_text('package com.bennybar.luli_for_reddit.data\n\nimport org.junit.Assert.assertEquals\nimport org.junit.Assert.assertFalse\nimport org.junit.Assert.assertTrue\nimport org.junit.Test\n\nclass OldRedditAllTest {\n    private val html = """\n        <div id="siteTable">\n          <div class="thing id-t3_a1 link odd" data-fullname="t3_a1"></div>\n          <div data-fullname=\'t3_b2\' class=\'link thing even\'></div>\n          <div class="thing comment" data-fullname="t1_c3"></div>\n          <div class="other" data-fullname="t3_d4"></div>\n          <div class="link thing odd" data-fullname="t3_a1"></div>\n        </div>\n        <span class="next-button"><a href="/r/all/?after=t3_b2">next</a></span>\n    """.trimIndent()\n\n    @Test fun parsesPostIdentifiersInOrderWithoutDuplicates() {\n        assertEquals(listOf("t3_a1", "t3_b2"), oldRedditAllPostIds(html))\n    }\n\n    @Test fun recognizesPaginationAndEndOfFeed() {\n        assertTrue(oldRedditAllHasNext(html))\n        assertFalse(oldRedditAllHasNext(html.substringBefore("<span class=\\"next-button\\">")))\n    }\n\n    @Test fun emptyOrBlockedPageDoesNotFabricatePosts() {\n        assertTrue(oldRedditAllPostIds("<html>Log in to Reddit</html>").isEmpty())\n    }\n}\n', encoding="utf-8")
 
     gradle_path = root / "app/build.gradle.kts"
     gradle = gradle_path.read_text(encoding="utf-8")
