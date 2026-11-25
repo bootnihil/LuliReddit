@@ -10,7 +10,7 @@ import argparse
 import re
 from pathlib import Path
 
-PATCH_REVISION = 2
+PATCH_REVISION = 3
 APP_ID = "com.bennybar.luli_for_reddit.bootnihil"
 
 
@@ -182,6 +182,23 @@ class EmptyAllFeedFallbackTest {
         raise RuntimeError("Upstream added OldRedditAllTest.kt; review before patching.")
     old_reddit_test_path.parent.mkdir(parents=True, exist_ok=True)
     old_reddit_test_path.write_text('package com.bennybar.luli_for_reddit.data\n\nimport org.junit.Assert.assertEquals\nimport org.junit.Assert.assertFalse\nimport org.junit.Assert.assertTrue\nimport org.junit.Test\n\nclass OldRedditAllTest {\n    private val html = """\n        <div id="siteTable">\n          <div class="thing id-t3_a1 link odd" data-fullname="t3_a1"></div>\n          <div data-fullname=\'t3_b2\' class=\'link thing even\'></div>\n          <div class="thing comment" data-fullname="t1_c3"></div>\n          <div class="other" data-fullname="t3_d4"></div>\n          <div class="link thing odd" data-fullname="t3_a1"></div>\n        </div>\n        <span class="next-button"><a href="/r/all/?after=t3_b2">next</a></span>\n    """.trimIndent()\n\n    @Test fun parsesPostIdentifiersInOrderWithoutDuplicates() {\n        assertEquals(listOf("t3_a1", "t3_b2"), oldRedditAllPostIds(html))\n    }\n\n    @Test fun recognizesPaginationAndEndOfFeed() {\n        assertTrue(oldRedditAllHasNext(html))\n        assertFalse(oldRedditAllHasNext(html.substringBefore("<span class=\\"next-button\\">")))\n    }\n\n    @Test fun emptyOrBlockedPageDoesNotFabricatePosts() {\n        assertTrue(oldRedditAllPostIds("<html>Log in to Reddit</html>").isEmpty())\n    }\n}\n', encoding="utf-8")
+
+    # Fix launcher aliases when applicationId differs from namespace.
+    icon_path = root / "app/src/main/java/com/bennybar/luli_for_reddit/core/AppIcon.kt"
+    icon = icon_path.read_text(encoding="utf-8")
+    icon = replace_exactly_once(
+        icon,
+        "ComponentName(pkg, pkg + icon.alias)",
+        'ComponentName(pkg, "com.bennybar.luli_for_reddit" + icon.alias)',
+        "selected launcher alias",
+    )
+    icon = replace_exactly_once(
+        icon,
+        "ComponentName(pkg, pkg + other.alias)",
+        'ComponentName(pkg, "com.bennybar.luli_for_reddit" + other.alias)',
+        "other launcher aliases",
+    )
+    icon_path.write_text(icon, encoding="utf-8")
 
     gradle_path = root / "app/build.gradle.kts"
     gradle = gradle_path.read_text(encoding="utf-8")
